@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: inventory
+    description: Vehicle inventory operations
 paths:
   /healthz:
     get:
@@ -24,8 +26,210 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /vehicles:
+    get:
+      operationId: listVehicles
+      tags: [inventory]
+      summary: List vehicles
+      parameters:
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [all, on_site, off_site]
+            default: all
+        - name: keysStatus
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/KeysStatus"
+      responses:
+        "200":
+          description: Vehicles in the inventory
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Vehicle"
+  /vehicles/import:
+    post:
+      operationId: importVehicles
+      tags: [inventory]
+      summary: Add registrations to inventory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VehicleImport"
+      responses:
+        "200":
+          description: Import results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VehicleImportResult"
+  /vehicles/{registrationNumber}:
+    patch:
+      operationId: updateVehicle
+      tags: [inventory]
+      summary: Update vehicle presence and key status
+      parameters:
+        - name: registrationNumber
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VehicleUpdate"
+      responses:
+        "200":
+          description: Updated vehicle
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Vehicle"
+        "404":
+          description: Vehicle not found
+    delete:
+      operationId: deleteVehicle
+      tags: [inventory]
+      summary: Remove vehicle from inventory
+      parameters:
+        - name: registrationNumber
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Vehicle removed
+        "404":
+          description: Vehicle not found
+  /inventory/summary:
+    get:
+      operationId: getInventorySummary
+      tags: [inventory]
+      summary: Get inventory totals and recent activity
+      responses:
+        "200":
+          description: Inventory summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InventorySummary"
 components:
   schemas:
+    KeysStatus:
+      type: string
+      enum: [unknown, in_vault, not_in_vault]
+    Vehicle:
+      type: object
+      required:
+        - registrationNumber
+        - onSite
+        - keysStatus
+        - addedAt
+        - updatedAt
+        - onSiteAt
+      properties:
+        registrationNumber:
+          type: string
+        onSite:
+          type: boolean
+        keysStatus:
+          $ref: "#/components/schemas/KeysStatus"
+        addedAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        onSiteAt:
+          type: [string, "null"]
+          format: date-time
+    VehicleImport:
+      type: object
+      required: [registrations]
+      properties:
+        registrations:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          maxItems: 1000
+    VehicleImportResult:
+      type: object
+      required: [created, existing, invalid, vehicles]
+      properties:
+        created:
+          type: integer
+        existing:
+          type: integer
+        invalid:
+          type: integer
+        vehicles:
+          type: array
+          items:
+            $ref: "#/components/schemas/Vehicle"
+    VehicleUpdate:
+      type: object
+      properties:
+        onSite:
+          type: boolean
+        keysStatus:
+          $ref: "#/components/schemas/KeysStatus"
+    InventoryActivity:
+      type: object
+      required: [registrationNumber, onSite, keysStatus, updatedAt]
+      properties:
+        registrationNumber:
+          type: string
+        onSite:
+          type: boolean
+        keysStatus:
+          $ref: "#/components/schemas/KeysStatus"
+        updatedAt:
+          type: string
+          format: date-time
+    InventorySummary:
+      type: object
+      required:
+        - total
+        - onSite
+        - offSite
+        - keysInVault
+        - keysNotInVault
+        - keysUnknown
+        - recentActivity
+      properties:
+        total:
+          type: integer
+        onSite:
+          type: integer
+        offSite:
+          type: integer
+        keysInVault:
+          type: integer
+        keysNotInVault:
+          type: integer
+        keysUnknown:
+          type: integer
+        recentActivity:
+          type: array
+          items:
+            $ref: "#/components/schemas/InventoryActivity"
     HealthStatus:
       type: object
       properties:

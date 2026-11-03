@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Car Inventory"
+description = "A simple mobile-friendly vehicle inventory system for importing Swedish registration numbers, scanning plates to mark vehicles on site, and tracking whether their keys are in the vault."
+version = "1.0.0"
+id = "artifacts/car-inventory"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 24941
+
+[services.development]
+run = "pnpm --filter @workspace/car-inventory run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/car-inventory", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/car-inventory/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24941"
+BASE_PATH = "/"

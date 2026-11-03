@@ -1,0 +1,1 @@
+- [Vault key checks](vault-key-checks.md) — Vehicle check-ins should prompt staff to record whether keys are secured in the locked vault.
