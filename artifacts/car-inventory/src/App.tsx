@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/reac
 import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { toast } from '@/hooks/use-toast';
 import NotFound from '@/pages/not-found';
 import {
   getGetInventorySummaryQueryKey,
@@ -24,6 +25,7 @@ import {
   ChevronDown,
   CircleHelp,
   Clock3,
+  Download,
   KeyRound,
   ListPlus,
   LoaderCircle,
@@ -47,9 +49,71 @@ const queryClient = new QueryClient();
 type FilterKey = 'all' | 'on_site' | 'off_site';
 type KeyFilter = 'all' | KeysStatus;
 type ScanStage = 'camera' | 'review' | 'keys';
+type PlateOcrWorker = Awaited<ReturnType<typeof import('tesseract.js').createWorker>>;
 
 const normalizePlate = (value: string) => value.toUpperCase().replace(/[\s-]/g, '').trim();
 const plateIsValid = (value: string) => /^[A-Z]{3}\d{2}[A-Z0-9]$/.test(normalizePlate(value));
+const findPlateCandidates = (text: string) => {
+  const compact = text.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const letterLookalikes: Record<string, string> = { '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '6': 'G', '8': 'B' };
+  const digitLookalikes: Record<string, string> = { O: '0', Q: '0', D: '0', I: '1', L: '1', Z: '2', S: '5', G: '6', B: '8' };
+  const exact: string[] = [];
+  const corrected: string[] = [];
+
+  for (let start = 0; start <= compact.length - 6; start += 1) {
+    const raw = compact.slice(start, start + 6);
+    if (plateIsValid(raw)) exact.push(raw);
+    const normalized = [...raw].map((character, index) => {
+      if (index < 3) return letterLookalikes[character] ?? character;
+      if (index < 5) return digitLookalikes[character] ?? character;
+      return character;
+    }).join('');
+    if (normalized !== raw && plateIsValid(normalized)) corrected.push(normalized);
+  }
+
+  return [...new Set([...exact, ...corrected])];
+};
+
+function createPlateCaptures(video: HTMLVideoElement) {
+  const sourceWidth = video.videoWidth;
+  const sourceHeight = video.videoHeight;
+  const full = document.createElement('canvas');
+  const fullScale = Math.min(1, 1600 / sourceWidth);
+  full.width = Math.round(sourceWidth * fullScale);
+  full.height = Math.round(sourceHeight * fullScale);
+  const fullContext = full.getContext('2d');
+  if (!fullContext) throw new Error('Unable to capture camera frame');
+  fullContext.drawImage(video, 0, 0, full.width, full.height);
+
+  const frame = video.parentElement;
+  if (!frame) return { focused: full, full };
+
+  const frameRect = frame.getBoundingClientRect();
+  const scale = Math.max(frameRect.width / sourceWidth, frameRect.height / sourceHeight);
+  const offsetX = (sourceWidth * scale - frameRect.width) / 2;
+  const offsetY = (sourceHeight * scale - frameRect.height) / 2;
+  // Include a little extra around the on-screen guide so slight framing errors don't clip the plate.
+  const left = Math.max(0, (frameRect.width * 0.04 + offsetX) / scale);
+  const top = Math.max(0, (frameRect.height * 0.19 + offsetY) / scale);
+  const right = Math.min(sourceWidth, (frameRect.width * 0.96 + offsetX) / scale);
+  const bottom = Math.min(sourceHeight, (frameRect.height * 0.81 + offsetY) / scale);
+  const cropWidth = right - left;
+  const cropHeight = bottom - top;
+  if (cropWidth < 32 || cropHeight < 16) return { focused: full, full };
+
+  const targetWidth = Math.min(2200, Math.max(1280, Math.round(cropWidth)));
+  const focused = document.createElement('canvas');
+  focused.width = targetWidth;
+  focused.height = Math.round(targetWidth * cropHeight / cropWidth);
+  const focusedContext = focused.getContext('2d');
+  if (!focusedContext) throw new Error('Unable to prepare plate image');
+  focusedContext.filter = 'grayscale(1) contrast(1.4)';
+  focusedContext.drawImage(video, left, top, cropWidth, cropHeight, 0, 0, focused.width, focused.height);
+  focusedContext.filter = 'none';
+
+  return { focused, full };
+}
+
 const parseRegistrationList = (value: string) => value.split(/[\n,;]+/).flatMap((segment) => {
   const platePattern = /[A-Z]{3}[\s-]?\d{2}[\s-]?[A-Z0-9]/gi;
   const matches = segment.match(platePattern) ?? [];
@@ -90,16 +154,22 @@ function Home() {
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState('');
   const [importResult, setImportResult] = useState<{ created: number; existing: number; invalid: number } | null>(null);
+  const [exporting, setExporting] = useState(false);
   const [scanStage, setScanStage] = useState<ScanStage>('camera');
   const [plateInput, setPlateInput] = useState('');
   const [scannedPlate, setScannedPlate] = useState('');
   const [scanMessage, setScanMessage] = useState('');
+  const [plateSuggestion, setPlateSuggestion] = useState(false);
   const [cameraError, setCameraError] = useState('');
   const [cameraReady, setCameraReady] = useState(false);
   const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrStatus, setOcrStatus] = useState('Reading plate');
   const [filterMenu, setFilterMenu] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const ocrWorkerRef = useRef<PlateOcrWorker | null>(null);
+  const ocrWorkerPromiseRef = useRef<Promise<PlateOcrWorker> | null>(null);
+  const scanAttemptRef = useRef(0);
   const queryClient = useQueryClient();
   const vehiclesQuery = useListVehicles();
   const summaryQuery = useGetInventorySummary();
@@ -128,7 +198,12 @@ function Home() {
   }, []);
 
   useEffect(() => () => {
+    scanAttemptRef.current += 1;
     streamRef.current?.getTracks().forEach((track) => track.stop());
+    if (ocrWorkerRef.current) void ocrWorkerRef.current.terminate();
+    else if (ocrWorkerPromiseRef.current) {
+      void ocrWorkerPromiseRef.current.then((worker) => worker.terminate()).catch(() => {});
+    }
   }, []);
 
   const startCamera = async () => {
@@ -138,14 +213,30 @@ function Home() {
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-        setCameraReady(true);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 30, max: 30 },
+        },
+        audio: false,
+      });
+      const video = videoRef.current;
+      if (!video) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
       }
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = stream;
+      video.srcObject = stream;
+      await video.play();
+      if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+        await new Promise<void>((resolve) => video.addEventListener('loadedmetadata', () => resolve(), { once: true }));
+      }
+      setCameraReady(true);
     } catch {
+      stopCamera();
       setCameraError('Camera permission was unavailable. You can still enter the plate manually.');
     }
   };
@@ -163,6 +254,9 @@ function Home() {
       return;
     }
     setScanMessage('');
+    scanAttemptRef.current += 1;
+    setOcrBusy(false);
+    setPlateSuggestion(false);
     setScannedPlate(plate);
     setPlateInput(plate);
     const found = allVehicles.find((item) => normalizePlate(item.registrationNumber) === plate);
@@ -189,46 +283,78 @@ function Home() {
       setCameraError('Camera is still starting. You can enter the plate manually.');
       return;
     }
+    const attempt = ++scanAttemptRef.current;
     setOcrBusy(true);
     setScanMessage('');
+    setPlateSuggestion(false);
     try {
-      const canvas = document.createElement('canvas');
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const context = canvas.getContext('2d');
-      if (!context) throw new Error('Unable to capture image');
-      context.drawImage(video, 0, 0);
+      const captures = createPlateCaptures(video);
       stopCamera();
-      const image = canvas.toDataURL('image/jpeg', 0.92);
-      const { createWorker } = await import('tesseract.js');
-      const worker = await createWorker('eng');
-      try {
-        const result = await worker.recognize(image);
-        const candidates = result.data.text.toUpperCase().match(/[A-Z]{3}[\s-]?\d{2}[\s-]?[A-Z0-9]/g) ?? [];
-        const candidate = candidates.map(normalizePlate).find(plateIsValid);
-        if (candidate) submitPlate(candidate);
-        else {
-          setScanMessage('We could not read a plate clearly. Try again or enter it manually.');
-          void startCamera();
-        }
-      } finally {
-        await worker.terminate();
+      setOcrStatus(ocrWorkerRef.current ? 'Reading plate' : 'Preparing plate reader');
+      const tesseract = await import('tesseract.js');
+      if (!ocrWorkerPromiseRef.current) {
+        ocrWorkerPromiseRef.current = tesseract.createWorker('eng')
+          .then(async (worker) => {
+            try {
+              await worker.setParameters({
+                tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                tessedit_pageseg_mode: tesseract.PSM.SINGLE_LINE,
+              });
+              ocrWorkerRef.current = worker;
+              return worker;
+            } catch (error) {
+              await worker.terminate();
+              throw error;
+            }
+          })
+          .catch((error) => {
+            ocrWorkerPromiseRef.current = null;
+            throw error;
+          });
       }
+      const worker = ocrWorkerRef.current ?? await ocrWorkerPromiseRef.current;
+      if (attempt !== scanAttemptRef.current) return;
+      setOcrStatus('Reading plate');
+      let candidates = findPlateCandidates((await worker.recognize(captures.focused)).data.text);
+      if (!candidates.length) {
+        await worker.setParameters({ tessedit_pageseg_mode: tesseract.PSM.SPARSE_TEXT });
+        try {
+          candidates = findPlateCandidates((await worker.recognize(captures.full)).data.text);
+        } finally {
+          await worker.setParameters({ tessedit_pageseg_mode: tesseract.PSM.SINGLE_LINE });
+        }
+      }
+      if (attempt !== scanAttemptRef.current) return;
+      const candidate = candidates[0];
+      if (candidate) {
+        setPlateInput(candidate);
+        setPlateSuggestion(true);
+        setScanMessage(`We read ${candidate}. Check the plate, correct it if needed, then continue.`);
+      } else {
+        setPlateSuggestion(false);
+        setScanMessage('No clear plate found. Move closer, keep it inside the guide, and avoid glare.');
+      }
+      void startCamera();
     } catch {
+      if (attempt !== scanAttemptRef.current) return;
+      setPlateSuggestion(false);
       setScanMessage('Plate reading could not start. Enter the registration manually.');
       void startCamera();
     } finally {
-      setOcrBusy(false);
+      if (attempt === scanAttemptRef.current) setOcrBusy(false);
     }
   };
 
   const closeScan = () => {
+    scanAttemptRef.current += 1;
     stopCamera();
     setScanOpen(false);
+    setOcrBusy(false);
     setScanStage('camera');
     setPlateInput('');
     setScannedPlate('');
     setScanMessage('');
+    setPlateSuggestion(false);
     setCameraError('');
   };
 
@@ -267,6 +393,131 @@ function Home() {
     });
   };
 
+  const exportInventory = async () => {
+    if (!vehicles.length || exporting) return;
+    setExporting(true);
+    try {
+      const { default: ExcelJS } = await import('exceljs');
+      const workbook = new ExcelJS.Workbook();
+      const exportedAt = new Date();
+      workbook.creator = 'Lot/Keep';
+      workbook.created = exportedAt;
+
+      const keyStatusLabel = (status: KeysStatus) => {
+        if (status === 'in_vault') return 'In vault';
+        if (status === 'not_in_vault') return 'Not in vault';
+        return 'Not checked';
+      };
+      const dateValue = (value: string | null) => {
+        if (!value) return 'Not recorded';
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? value : parsed;
+      };
+
+      const overview = workbook.addWorksheet('Overview');
+      overview.columns = [{ width: 28 }, { width: 42 }];
+      overview.mergeCells('A1:B1');
+      overview.getCell('A1').value = 'Fleet inventory report';
+      overview.getCell('A1').font = { bold: true, size: 18, color: { argb: 'FFFFFFFF' } };
+      overview.getCell('A1').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF203840' } };
+      overview.getRow(1).height = 32;
+      overview.addRow(['Generated', exportedAt]);
+      overview.getCell('B2').numFmt = 'dd mmm yyyy hh:mm';
+      overview.addRow([]);
+      const summaryHeader = overview.addRow(['Inventory summary', 'Vehicles']);
+      summaryHeader.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      summaryHeader.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF426D65' } };
+      [
+        ['Vehicles included', vehicles.length],
+        ['On site', vehicles.filter((vehicle) => vehicle.onSite).length],
+        ['Off site', vehicles.filter((vehicle) => !vehicle.onSite).length],
+        ['Keys in vault', vehicles.filter((vehicle) => vehicle.keysStatus === 'in_vault').length],
+        ['Keys not in vault', vehicles.filter((vehicle) => vehicle.keysStatus === 'not_in_vault').length],
+        ['Key status not checked', vehicles.filter((vehicle) => vehicle.keysStatus === 'unknown').length],
+      ].forEach((row) => overview.addRow(row));
+      overview.addRow([]);
+      const filtersHeader = overview.addRow(['Current filters', 'Value']);
+      filtersHeader.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      filtersHeader.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF426D65' } };
+      overview.addRow(['Presence', presence === 'all' ? 'All vehicles' : presence === 'on_site' ? 'On site' : 'Off site']);
+      overview.addRow(['Key status', keyFilter === 'all' ? 'All statuses' : keyStatusLabel(keyFilter)]);
+      overview.addRow(['Registration search', search.trim() || 'None']);
+      overview.addRow(['Export scope', 'Vehicles currently shown in the fleet register']);
+      overview.eachRow((row) => {
+        row.alignment = { vertical: 'middle' };
+        row.height = 21;
+      });
+
+      const register = workbook.addWorksheet('Fleet register', { views: [{ state: 'frozen', ySplit: 1 }] });
+      register.columns = [
+        { header: 'Registration', key: 'registration', width: 18 },
+        { header: 'Presence', key: 'presence', width: 16 },
+        { header: 'Key status', key: 'keyStatus', width: 20 },
+        { header: 'Last on site', key: 'lastOnSite', width: 23 },
+        { header: 'Last updated', key: 'lastUpdated', width: 23 },
+        { header: 'Added to inventory', key: 'addedAt', width: 23 },
+      ];
+      register.addRows(vehicles.map((vehicle) => ({
+        registration: vehicle.registrationNumber,
+        presence: vehicle.onSite ? 'On site' : 'Off site',
+        keyStatus: keyStatusLabel(vehicle.keysStatus),
+        lastOnSite: dateValue(vehicle.onSiteAt),
+        lastUpdated: dateValue(vehicle.updatedAt),
+        addedAt: dateValue(vehicle.addedAt),
+      })));
+      register.autoFilter = { from: 'A1', to: `F${vehicles.length + 1}` };
+      register.getRow(1).height = 25;
+      register.getRow(1).eachCell((cell) => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF203840' } };
+        cell.alignment = { vertical: 'middle' };
+      });
+      register.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+        if (rowNumber === 1) return;
+        row.height = 22;
+        row.eachCell((cell) => {
+          cell.alignment = { vertical: 'middle' };
+          if (rowNumber % 2 === 0) {
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF3F7F5' } };
+          }
+        });
+        row.getCell(4).numFmt = 'dd mmm yyyy hh:mm';
+        row.getCell(5).numFmt = 'dd mmm yyyy hh:mm';
+        row.getCell(6).numFmt = 'dd mmm yyyy hh:mm';
+        const presenceCell = row.getCell(2);
+        presenceCell.font = { bold: true, color: { argb: presenceCell.value === 'On site' ? 'FF246849' : 'FF96631E' } };
+        const keysCell = row.getCell(3);
+        if (keysCell.value === 'In vault') keysCell.font = { bold: true, color: { argb: 'FF246849' } };
+        else if (keysCell.value === 'Not in vault') keysCell.font = { bold: true, color: { argb: 'FF96631E' } };
+      });
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer as BlobPart], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `fleet-inventory-${new Intl.DateTimeFormat('sv-SE').format(exportedAt)}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast({
+        title: 'Excel file downloaded',
+        description: `${vehicles.length} vehicle${vehicles.length === 1 ? '' : 's'} exported.`,
+      });
+    } catch {
+      toast({
+        title: 'Export failed',
+        description: 'Could not create the Excel file. Please try again.',
+        variant: 'destructive',
+      });
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const filters = [
     { id: 'all' as const, label: 'All vehicles', count: summary?.total },
     { id: 'on_site' as const, label: 'On site', count: summary?.onSite },
@@ -295,6 +546,7 @@ function Home() {
           </div>
           <div className="heading-actions">
             <button className="button button-quiet" onClick={() => { setImportOpen(true); setImportResult(null); }} data-testid="button-import-list"><ListPlus size={17} /> Import list</button>
+            <button className="button button-quiet" disabled={exporting || !vehicles.length} onClick={() => void exportInventory()} title="Export the vehicles currently shown as an Excel workbook" data-testid="button-export-excel">{exporting ? <LoaderCircle className="spin" size={17} /> : <Download size={17} />} {exporting ? 'Preparing…' : 'Export Excel'}</button>
             <button className="button button-primary" onClick={() => { setScanOpen(true); setScanStage('camera'); }} data-testid="button-scan-plate"><ScanLine size={17} /> Scan a plate</button>
           </div>
         </section>
@@ -395,24 +647,24 @@ function Home() {
               <video ref={videoRef} muted playsInline aria-label="Camera plate view" data-testid="video-plate-camera" />
               <div className="camera-overlay"><span /><span /></div>
               {!cameraReady && <div className="camera-placeholder"><ScanLine size={28} /><span>Frame the registration plate</span></div>}
-              {ocrBusy && <div className="ocr-cover"><LoaderCircle className="spin" size={26} /><span>Reading plate</span></div>}
+              {ocrBusy && <div className="ocr-cover"><LoaderCircle className="spin" size={26} /><span>{ocrStatus}</span></div>}
             </div>
             {cameraError && <p className="inline-notice"><AlertCircle size={15} />{cameraError}</p>}
-            {scanMessage && <p className="inline-notice notice-warning"><AlertCircle size={15} />{scanMessage}</p>}
+            {scanMessage && <p className={`inline-notice ${plateSuggestion ? 'notice-success' : 'notice-warning'}`}>{plateSuggestion ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}{scanMessage}</p>}
             <button className="button button-primary button-wide" disabled={ocrBusy} onClick={() => void captureAndRead()} data-testid="button-capture-plate">{ocrBusy ? <LoaderCircle className="spin" size={17} /> : <ScanLine size={17} />} Capture plate</button>
             <div className="manual-divider"><span />or enter it manually<span /></div>
             <div className="manual-entry">
-              <input value={plateInput} onChange={(event) => setPlateInput(event.target.value.toUpperCase())} maxLength={8} placeholder="ABC 123" aria-label="Registration number" data-testid="input-manual-registration" onKeyDown={(event) => { if (event.key === 'Enter') submitPlate(plateInput); }} />
+              <input value={plateInput} onChange={(event) => { setPlateInput(event.target.value.toUpperCase()); setPlateSuggestion(false); setScanMessage(''); }} maxLength={8} placeholder="ABC 123" aria-label="Registration number" data-testid="input-manual-registration" onKeyDown={(event) => { if (event.key === 'Enter') submitPlate(plateInput); }} />
               <button className="button button-secondary" onClick={() => submitPlate(plateInput)} data-testid="button-submit-registration">Continue <ArrowDownLeft size={15} /></button>
             </div>
-            <p className="helper-copy">Swedish plates use three letters and three characters.</p>
+            <p className="helper-copy">Center the plate in the guide. Keep it steady and avoid glare. Check the read before continuing.</p>
           </div>}
           {scanStage === 'review' && <div className="scan-content review-content">
             <div className="plate-preview">{scannedPlate}</div>
             <div className="review-note"><div className="review-icon"><Plus size={18} /></div><div><strong>Not in the register yet</strong><p>Add it now and mark it on site. You can confirm the key location next.</p></div></div>
             {scanMessage && <p className="inline-notice notice-warning"><AlertCircle size={15} />{scanMessage}</p>}
             <button className="button button-primary button-wide" disabled={importVehicles.isPending || updateVehicle.isPending} onClick={addScannedVehicle} data-testid="button-add-scanned-vehicle">{importVehicles.isPending || updateVehicle.isPending ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />} Add vehicle & continue</button>
-            <button className="text-action" onClick={() => { setScanStage('camera'); setScanMessage(''); }} data-testid="button-rescan-plate">Try another plate</button>
+            <button className="text-action" onClick={() => { setPlateInput(''); setScannedPlate(''); setScanStage('camera'); setScanMessage(''); }} data-testid="button-rescan-plate">Try another plate</button>
           </div>}
           {scanStage === 'keys' && <div className="scan-content keys-content">
             <div className="plate-preview">{scannedPlate}</div>

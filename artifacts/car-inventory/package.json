@@ -75,6 +75,7 @@
     "zod": "catalog:"
   },
   "dependencies": {
+    "exceljs": "^4.4.0",
     "tesseract.js": "^7.0.0"
   }
 }
