@@ -53,6 +53,44 @@ type PlateOcrWorker = Awaited<ReturnType<typeof import('tesseract.js').createWor
 
 const normalizePlate = (value: string) => value.toUpperCase().replace(/[\s-]/g, '').trim();
 const plateIsValid = (value: string) => /^[A-Z]{3}\d{2}[A-Z0-9]$/.test(normalizePlate(value));
+const scorePlateCandidate = (value: string) => {
+  const normalized = normalizePlate(value);
+  let score = 0;
+  if (!normalized) return 0;
+  if (plateIsValid(normalized)) score += 100;
+  if (/^[A-Z]{3}\d{3}$/.test(normalized)) score += 40;
+  if (/^[A-Z]{3}\d{2}[A-Z0-9]$/.test(normalized)) score += 30;
+  if (/^[A-Z0-9]+$/.test(normalized)) score += 10;
+  if (normalized.length >= 6 && normalized.length <= 8) score += 15;
+  if (normalized.startsWith('A') || normalized.startsWith('B') || normalized.startsWith('C')) score += 5;
+  return score;
+};
+const enhancePlateCanvas = (source: HTMLCanvasElement) => {
+  const canvas = document.createElement('canvas');
+  canvas.width = source.width;
+  canvas.height = source.height;
+  const context = canvas.getContext('2d');
+  if (!context) return source;
+
+  context.drawImage(source, 0, 0);
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const { data } = imageData;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const red = data[i];
+    const green = data[i + 1];
+    const blue = data[i + 2];
+    const gray = Math.round((red * 0.299) + (green * 0.587) + (blue * 0.114));
+    const boosted = Math.min(255, Math.max(0, (gray - 128) * 1.9 + 128));
+    const thresholded = boosted > 170 ? 255 : boosted < 90 ? 0 : boosted;
+    data[i] = thresholded;
+    data[i + 1] = thresholded;
+    data[i + 2] = thresholded;
+  }
+
+  context.putImageData(imageData, 0, 0);
+  return canvas;
+};
 const findPlateCandidates = (text: string) => {
   const compact = text.toUpperCase().replace(/[^A-Z0-9]/g, '');
   const letterLookalikes: Record<string, string> = { '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '6': 'G', '8': 'B' };
@@ -71,7 +109,7 @@ const findPlateCandidates = (text: string) => {
     if (normalized !== raw && plateIsValid(normalized)) corrected.push(normalized);
   }
 
-  return [...new Set([...exact, ...corrected])];
+  return [...new Set([...exact, ...corrected])].sort((a, b) => scorePlateCandidate(b) - scorePlateCandidate(a));
 };
 
 function createPlateCaptures(video: HTMLVideoElement) {
@@ -92,7 +130,6 @@ function createPlateCaptures(video: HTMLVideoElement) {
   const scale = Math.max(frameRect.width / sourceWidth, frameRect.height / sourceHeight);
   const offsetX = (sourceWidth * scale - frameRect.width) / 2;
   const offsetY = (sourceHeight * scale - frameRect.height) / 2;
-  // Include a little extra around the on-screen guide so slight framing errors don't clip the plate.
   const left = Math.max(0, (frameRect.width * 0.04 + offsetX) / scale);
   const top = Math.max(0, (frameRect.height * 0.19 + offsetY) / scale);
   const right = Math.min(sourceWidth, (frameRect.width * 0.96 + offsetX) / scale);
@@ -107,7 +144,7 @@ function createPlateCaptures(video: HTMLVideoElement) {
   focused.height = Math.round(targetWidth * cropHeight / cropWidth);
   const focusedContext = focused.getContext('2d');
   if (!focusedContext) throw new Error('Unable to prepare plate image');
-  focusedContext.filter = 'grayscale(1) contrast(1.4)';
+  focusedContext.filter = 'grayscale(1) contrast(2.3) brightness(1.15)';
   focusedContext.drawImage(video, left, top, cropWidth, cropHeight, 0, 0, focused.width, focused.height);
   focusedContext.filter = 'none';
 
@@ -314,22 +351,37 @@ function Home() {
       }
       const worker = ocrWorkerRef.current ?? await ocrWorkerPromiseRef.current;
       if (attempt !== scanAttemptRef.current) return;
-      setOcrStatus('Reading plate');
-      let candidates = findPlateCandidates((await worker.recognize(captures.focused)).data.text);
-      if (!candidates.length) {
-        await worker.setParameters({ tessedit_pageseg_mode: tesseract.PSM.SPARSE_TEXT });
-        try {
-          candidates = findPlateCandidates((await worker.recognize(captures.full)).data.text);
-        } finally {
-          await worker.setParameters({ tessedit_pageseg_mode: tesseract.PSM.SINGLE_LINE });
+
+      const variants = [
+        { canvas: captures.focused, mode: tesseract.PSM.SINGLE_LINE },
+        { canvas: enhancePlateCanvas(captures.focused), mode: tesseract.PSM.SINGLE_LINE },
+        { canvas: captures.full, mode: tesseract.PSM.SPARSE_TEXT },
+        { canvas: enhancePlateCanvas(captures.full), mode: tesseract.PSM.SPARSE_TEXT },
+      ];
+
+      const scoredCandidates = new Map<string, number>();
+
+      for (const variant of variants) {
+        await worker.setParameters({
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+          tessedit_pageseg_mode: variant.mode,
+        });
+        const result = await worker.recognize(variant.canvas);
+        const rawText = result.data.text ?? '';
+        const candidates = findPlateCandidates(rawText);
+        for (const candidate of candidates) {
+          scoredCandidates.set(candidate, Math.max(scoredCandidates.get(candidate) ?? 0, scorePlateCandidate(candidate)));
         }
       }
+
       if (attempt !== scanAttemptRef.current) return;
-      const candidate = candidates[0];
-      if (candidate) {
-        setPlateInput(candidate);
+
+      const bestCandidate = [...scoredCandidates.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+
+      if (bestCandidate) {
+        setPlateInput(bestCandidate);
         setPlateSuggestion(true);
-        setScanMessage(`We read ${candidate}. Check the plate, correct it if needed, then continue.`);
+        setScanMessage(`We read ${bestCandidate}. Check the plate, correct it if needed, then continue.`);
       } else {
         setPlateSuggestion(false);
         setScanMessage('No clear plate found. Move closer, keep it inside the guide, and avoid glare.');
@@ -546,7 +598,7 @@ function Home() {
           </div>
           <div className="heading-actions">
             <button className="button button-quiet" onClick={() => { setImportOpen(true); setImportResult(null); }} data-testid="button-import-list"><ListPlus size={17} /> Import list</button>
-            <button className="button button-quiet" disabled={exporting || !vehicles.length} onClick={() => void exportInventory()} title="Export the vehicles currently shown as an Excel workbook" data-testid="button-export-excel">{exporting ? <LoaderCircle className="spin" size={17} /> : <Download size={17} />} {exporting ? 'Preparing…' : 'Export Excel'}</button>
+            <button className="button button-quiet" disabled={exporting || !vehicles.length} onClick={() => void exportInventory()} title="Export the vehicles currently shown as an Excel workbook" data-testid="button-export-excel">{exporting ? <LoaderCircle className="spin" size={17} /> : <Download size={17} />} Export</button>
             <button className="button button-primary" onClick={() => { setScanOpen(true); setScanStage('camera'); }} data-testid="button-scan-plate"><ScanLine size={17} /> Scan a plate</button>
           </div>
         </section>
@@ -615,14 +667,14 @@ function Home() {
               <div className="empty-symbol"><Search size={23} /></div>
               <h3>{search || presence !== 'all' || keyFilter !== 'all' ? 'No vehicles match' : 'A clear lot to start'}</h3>
               <p>{search || presence !== 'all' || keyFilter !== 'all' ? 'Try another plate or adjust your filters.' : 'Scan a plate or import a register to see every vehicle here.'}</p>
-              {!(search || presence !== 'all' || keyFilter !== 'all') && <button className="button button-primary" onClick={() => setScanOpen(true)} data-testid="button-scan-empty"><ScanLine size={16} /> Scan first vehicle</button>}
+              {!(search || presence !== 'all' || keyFilter !== 'all') && <button className="button button-primary" onClick={() => setScanOpen(true)} data-testid="button-scan-empty"><ScanLine size={17} /> Scan first vehicle</button>}
               {(search || presence !== 'all' || keyFilter !== 'all') && <button className="text-action" onClick={() => { setSearch(''); setPresence('all'); setKeyFilter('all'); }} data-testid="button-reset-filters">Clear all filters</button>}
             </div>
           ) : (
             <div className="vehicle-list" data-testid="list-vehicles">
               <div className="vehicle-list-head"><span>REGISTRATION</span><span>PRESENCE</span><span>KEY LOCATION</span><span>LAST SEEN</span><span /></div>
               {vehicles.map((vehicle) => (
-                <VehicleRow key={vehicle.registrationNumber} vehicle={vehicle} pending={updateVehicle.isPending} onPresence={() => updateVehicle.mutate({ registrationNumber: vehicle.registrationNumber, data: { onSite: !vehicle.onSite } })} onKeys={(keysStatus) => updateVehicle.mutate({ registrationNumber: vehicle.registrationNumber, data: { keysStatus } })} onDelete={() => {
+                <VehicleRow key={vehicle.registrationNumber} vehicle={vehicle} pending={updateVehicle.isPending} onPresence={() => updateVehicle.mutate({ registrationNumber: vehicle.registrationNumber, data: { onSite: !vehicle.onSite } })} onKeys={(status) => updateVehicle.mutate({ registrationNumber: vehicle.registrationNumber, data: { keysStatus: status } })} onDelete={() => {
                   if (window.confirm(`Remove ${vehicle.registrationNumber} from the inventory?`)) deleteVehicle.mutate({ registrationNumber: vehicle.registrationNumber });
                 }} deletePending={deleteVehicle.isPending} />
               ))}
@@ -663,15 +715,15 @@ function Home() {
             <div className="plate-preview">{scannedPlate}</div>
             <div className="review-note"><div className="review-icon"><Plus size={18} /></div><div><strong>Not in the register yet</strong><p>Add it now and mark it on site. You can confirm the key location next.</p></div></div>
             {scanMessage && <p className="inline-notice notice-warning"><AlertCircle size={15} />{scanMessage}</p>}
-            <button className="button button-primary button-wide" disabled={importVehicles.isPending || updateVehicle.isPending} onClick={addScannedVehicle} data-testid="button-add-scanned-vehicle">{importVehicles.isPending || updateVehicle.isPending ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />} Add vehicle & continue</button>
+            <button className="button button-primary button-wide" disabled={importVehicles.isPending || updateVehicle.isPending} onClick={addScannedVehicle} data-testid="button-add-scanned-vehicle">Add vehicle & continue</button>
             <button className="text-action" onClick={() => { setPlateInput(''); setScannedPlate(''); setScanStage('camera'); setScanMessage(''); }} data-testid="button-rescan-plate">Try another plate</button>
           </div>}
           {scanStage === 'keys' && <div className="scan-content keys-content">
             <div className="plate-preview">{scannedPlate}</div>
             <p className="question-copy">Are this vehicle’s keys secured in the locked vault?</p>
             {scanMessage && <p className="inline-notice notice-warning"><AlertCircle size={15} />{scanMessage}</p>}
-            <button className="key-choice key-choice-yes" disabled={updateVehicle.isPending} onClick={() => setScannedKeys('in_vault')} data-testid="button-keys-in-vault"><ShieldCheck size={21} /><span><strong>Yes, in the vault</strong><small>Keys are secured</small></span><ArrowDownLeft size={17} /></button>
-            <button className="key-choice key-choice-no" disabled={updateVehicle.isPending} onClick={() => setScannedKeys('not_in_vault')} data-testid="button-keys-not-in-vault"><KeyRound size={21} /><span><strong>No, not in the vault</strong><small>Keys are elsewhere</small></span><ArrowDownLeft size={17} /></button>
+            <button className="key-choice key-choice-yes" disabled={updateVehicle.isPending} onClick={() => setScannedKeys('in_vault')} data-testid="button-keys-in-vault"><ShieldCheck size={21} /><span><strong>Yes, in the vault</strong><small>Keys are secured</small></span></button>
+            <button className="key-choice key-choice-no" disabled={updateVehicle.isPending} onClick={() => setScannedKeys('not_in_vault')} data-testid="button-keys-not-in-vault"><KeyRound size={21} /><span><strong>No, not in the vault</strong><small>Keys are elsewhere</small></span></button>
             <button className="text-action" onClick={closeScan} data-testid="button-skip-key-check">Leave key status unchanged</button>
           </div>}
         </section>
@@ -709,16 +761,20 @@ function VehicleRow({ vehicle, pending, onPresence, onKeys, onDelete, deletePend
     <article className={`vehicle-row ${vehicle.onSite ? 'vehicle-on-site' : ''}`} data-testid={`row-vehicle-${vehicle.registrationNumber}`}>
       <div className="plate-cell"><span className="plate-mini">{vehicle.registrationNumber}</span><span className="mobile-last-seen">{relativeTime(vehicle.updatedAt)}</span></div>
       <div className="presence-cell">
-        <button className="row-action" disabled={pending} onClick={onPresence} aria-label={`Mark ${vehicle.registrationNumber} ${vehicle.onSite ? 'off site' : 'on site'}`} data-testid={`button-toggle-presence-${vehicle.registrationNumber}`}><StatusPill onSite={vehicle.onSite} registration={vehicle.registrationNumber} /><ChevronDown size={13} /></button>
+        <button className="row-action" disabled={pending} onClick={onPresence} aria-label={`Mark ${vehicle.registrationNumber} ${vehicle.onSite ? 'off site' : 'on site'}`} data-testid={`button-toggle-presence-${vehicle.registrationNumber}`}>
+          <StatusPill onSite={vehicle.onSite} registration={vehicle.registrationNumber} />
+        </button>
       </div>
       <div className="keys-cell">
-        <button className="row-action" disabled={pending} onClick={() => setKeyMenuOpen((value) => !value)} aria-expanded={keyMenuOpen} data-testid={`button-key-status-${vehicle.registrationNumber}`}><KeyLabel status={vehicle.keysStatus} /><ChevronDown size={13} /></button>
+        <button className="row-action" disabled={pending} onClick={() => setKeyMenuOpen((value) => !value)} aria-expanded={keyMenuOpen} data-testid={`button-key-status-${vehicle.registrationNumber}`}>
+          <KeyLabel status={vehicle.keysStatus} />
+        </button>
         {keyMenuOpen && <div className="key-menu">
           {([
             ['in_vault', 'In vault'],
             ['not_in_vault', 'Not in vault'],
             ['unknown', 'Unknown'],
-          ] as [KeysStatus, string][]).map(([status, label]) => <button key={status} onClick={() => { onKeys(status); setKeyMenuOpen(false); }} data-testid={`button-set-key-${status}-${vehicle.registrationNumber}`}><KeyLabel status={status} /></button>)}
+          ] as [KeysStatus, string][]).map(([status, label]) => <button key={status} onClick={() => { onKeys(status); setKeyMenuOpen(false); }} data-testid={`button-set-key-${status}-${vehicle.registrationNumber}`}><KeyLabel status={status} />{label}</button>)}
         </div>}
       </div>
       <div className="last-seen-cell"><span>{relativeTime(vehicle.updatedAt)}</span>{vehicle.onSiteAt && vehicle.onSite && <small>Arrived {new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit' }).format(new Date(vehicle.onSiteAt))}</small>}</div>
@@ -741,8 +797,6 @@ function relativeTime(dateValue: string) {
 
 function Router() {
   return (
-    // Keep a shared shell (sidebar, navbar) outside the boundary so it
-    // survives a page crash.
     <RoutedErrorBoundary>
       <Switch>
         <Route path="/" component={Home} />
